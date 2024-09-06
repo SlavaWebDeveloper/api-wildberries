@@ -35,20 +35,53 @@ async function getColumnIndexes() {
     // Укажите строку, где находятся заголовки
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: 'Лист2!6:6' // Измените строку по необходимости
+      range: 'Лист2!6:6' // Измените строку по необходимости, если строка с данными в колонке изменилась
     });
 
-    const headers = response.data.values ? response.data.values[0] : [];
+    const day = getFormattedDate();
 
+    const headers = response.data.values ? response.data.values[0] : [];
     const campaignIdColumn = headers.indexOf('ID кампании') + 1;
     const viewsColumn = headers.indexOf('Показы') + 1;
     const clicksColumn = headers.indexOf('Клики') + 1;
+    const clicksCartColumn = headers.indexOf('Клик-карзина') + 1;
+    const cartOrderColumn = headers.indexOf('Карзина-Заказ') + 1;
+    let dayColumn = headers.indexOf(day) + 1;
 
-    if (campaignIdColumn <= 0 || viewsColumn <= 0 || clicksColumn <= 0) {
+    if (dayColumn === 0) {
+      dayColumn = headers.length + 1;
+
+      // Обновляем заголовок с новой датой в Google Sheets
+      headers.push(day);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SHEET_ID,
+        range: 'Лист2!6:6', // Диапазон заголовков
+        valueInputOption: 'RAW',
+        resource: { values: [headers] } // Добавляем дату в конец
+      });
+
+      console.log(`Добавлена новая колонка для даты: ${day}`);
+    }
+
+    if (
+      campaignIdColumn <= 0
+      || viewsColumn <= 0
+      || clicksColumn <= 0
+      || clicksCartColumn <= 0
+      || cartOrderColumn <= 0
+      || dayColumn <= 0
+    ) {
       throw new Error('Не удалось найти все нужные заголовки');
     }
 
-    return { campaignIdColumn, viewsColumn, clicksColumn };
+    return {
+      campaignIdColumn,
+      viewsColumn,
+      clicksColumn,
+      clicksCartColumn,
+      cartOrderColumn,
+      dayColumn
+    };
   } catch (error) {
     console.error('Ошибка при получении заголовков:', error.message);
     throw error;
@@ -94,21 +127,61 @@ async function getStatistics(campaignIds) {
   }
 }
 
-function handleApiError(error) {
+function handleApiError(error, retryCount = 0) {
+  const maxRetries = 3;
+  const retryDelay = 10 * 60 * 1000; // 10 минут в миллисекундах
+
+  if (retryCount >= maxRetries) {
+    console.error('Превышено максимальное количество попыток');
+    return;
+  }
+
   if (error.response) {
     const status = error.response.status;
+
     if (status === 429) {
-      console.error('Превышен лимит запросов');
+      console.error('Превышен лимит запросов, повтор через 10 минут');
       setTimeout(() => {
-        processStatistics();
-      }, 70000); 
+        processStatisticsWithRetries(retryCount + 1);
+      }, retryDelay);
     } else if (status === 204) {
       console.log('Нет данных для запрашиваемой кампании.');
     } else {
       console.error('Ошибка при запросе:', error.response.data);
+      console.error('Повторная попытка через 10 минут');
+      setTimeout(() => {
+        processStatisticsWithRetries(retryCount + 1);
+      }, retryDelay);
     }
   } else {
     console.error('Ошибка сети или сервера:', error.message);
+    console.error('Повторная попытка через 10 минут');
+    setTimeout(() => {
+      processStatisticsWithRetries(retryCount + 1);
+    }, retryDelay);
+  }
+}
+
+async function processStatisticsWithRetries(retryCount = 0) {
+  try {
+    const campaignIds = await getCompainsById();
+    const statistics = await getStatistics(campaignIds);
+    const dayFroRes = getFormattedDate();
+
+    const result = statistics.map(stat => ({
+      id: stat.advertId,
+      day: dayFroRes,
+      views: stat.views || 0,
+      clicks: stat.clicks || 0,
+      clicksCart: stat.clicks > 0 ? `${((stat.atbs / stat.clicks) * 100).toFixed(2)}%` : '0.00%',
+      cartOrder: stat.atbs > 0 ? `${((stat.orders / stat.atbs) * 100).toFixed(2)}%` : '0.00%',
+      sum: `р.${stat.sum}`
+    }));
+
+    console.log('Статистика кампаний:', result);
+    await updateGoogleSheet(result);
+  } catch (error) {
+    handleApiError(error, retryCount);
   }
 }
 
@@ -116,12 +189,16 @@ async function processStatistics() {
   try {
     const campaignIds = await getCompainsById();
     const statistics = await getStatistics(campaignIds);
+    const dayFroRes = getFormattedDate();
 
     const result = statistics.map(stat => ({
       id: stat.advertId,
-      day: getYesterdayDate(),
+      day: dayFroRes,
       views: stat.views || 0,
-      clicks: stat.clicks || 0
+      clicks: stat.clicks || 0,
+      clicksCart: stat.clicks > 0 ? `${((stat.atbs / stat.clicks) * 100).toFixed(2)}%` : '0.00%',
+      cartOrder: stat.atbs > 0 ? `${((stat.orders / stat.atbs) * 100).toFixed(2)}%` : '0.00%',
+      sum: `р.${stat.sum}`
     }));
 
     console.log('Статистика кампаний:', result);
@@ -138,12 +215,18 @@ function getYesterdayDate() {
   return yesterday.toISOString().split('T')[0]; // Формат YYYY-MM-DD
 }
 
+function getFormattedDate() {
+  const rawDate = getYesterdayDate();
+  const [year, month, day] = rawDate.split('-');
+  return `${day}.${month}.${year.slice(2)}`;
+}
+
 // Функция для получения всех данных из таблицы
 async function getAllRows() {
   try {
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: SHEET_ID,
-      range: 'Лист2!A:Z' // Укажите диапазон, который охватывает все ваши данные
+      range: 'Лист2!A:ZZ' // Укажите диапазон, который охватывает все ваши данные
     });
 
     return response.data.values || [];
@@ -156,9 +239,16 @@ async function getAllRows() {
 // Функция для обновления Google Sheets
 async function updateGoogleSheet(data) {
   try {
-    const { campaignIdColumn, viewsColumn, clicksColumn } = await getColumnIndexes();
-    
-    if (!campaignIdColumn || !viewsColumn || !clicksColumn) {
+    const { campaignIdColumn, viewsColumn, clicksColumn, clicksCartColumn, cartOrderColumn, dayColumn } = await getColumnIndexes();
+
+    if (
+      !campaignIdColumn
+      || !viewsColumn
+      || !clicksColumn
+      || !clicksCartColumn
+      || !cartOrderColumn
+      || !dayColumn
+    ) {
       throw new Error('Не удалось получить индексы колонок');
     }
 
@@ -169,25 +259,27 @@ async function updateGoogleSheet(data) {
       if (rowIndex !== -1) {
         rows[rowIndex][viewsColumn - 1] = stat.views; // Обновляем показы
         rows[rowIndex][clicksColumn - 1] = stat.clicks; // Обновляем клики
+        rows[rowIndex][clicksCartColumn - 1] = stat.clicksCart;
+        rows[rowIndex][cartOrderColumn - 1] = stat.cartOrder;
+        rows[rowIndex][dayColumn - 1] = stat.sum;
       }
     });
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: SHEET_ID,
-      range: 'Лист2!A:Z', // Укажите диапазон для обновления
+      range: 'Лист2!A:ZZ',
       valueInputOption: 'RAW',
       resource: { values: rows }
     });
 
-    console.log('Таблица обновлена.');
   } catch (error) {
     console.error('Ошибка при обновлении Google Sheets:', error.message);
   }
 }
 
-// Запуск процесса каждую минуту
-cron.schedule('* * * * *', async () => {
-  console.log('Запуск задачи каждую минуту');
+// Запуск процесса каждый день в 00:10
+cron.schedule('10 00 * * *', async () => {
+  console.log('Запуск задачи каждый день в 00:10');
   const statistics = await processStatistics();
   await updateGoogleSheet(statistics);
 });
