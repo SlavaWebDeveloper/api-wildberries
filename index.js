@@ -1,3 +1,4 @@
+# Свяжитесь со мной @antony_work
 require('dotenv').config();
 const axios = require('axios');
 const fs = require('fs');
